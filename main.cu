@@ -12,9 +12,16 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+#include <cutlass/gemm/dispatch_policy.hpp>
 
 #define p(v) std::cout << #v << " : " << v << std::endl
 #define kp(v) cute::print(#v " : "); cute::print(v); cute::print("\n")
+#define pp(v) if (cute::thread0()) { printf("L%u : ", __LINE__); cute::print(#v " : "); cute::print(v); cute::print("\n"); }
+
+// #define p(v)
+// #define kp(v)
+// #define pp(v)
+
 
 void test_int_tuple() {
     // auto tup = cute::IntTuple<int, uint32_t, size_t>({1, 2U, 3U});
@@ -55,6 +62,11 @@ void test_layout() {
     p(ly(1));             // 1
     p(ly(59));            // 59
 
+    // assume ly = (a1, a2):(s1, s2), then ly(x1, x2) = x1 * s1 + x2 * s2
+    // therefore, transpose only need to change the order of shape and stride, and
+    // the memory can keep unchanged
+    // ((a1, a2):(s1, s2))(x1, x2) = ((a2, a1):(s2, s1))(x2, x1)
+
     // show 2d coord to offset ascii view, only support 2d layout
     cute::print_layout(cute::make_layout(cute::make_shape(8, 4), cute::make_shape(4, 2)));
     // or print_latex for latex source
@@ -74,17 +86,29 @@ void test_layout_opeartion() {
     p(cute::coalesce(nest_ly2));    // _32:_1
 
     // composition
+    //   - composition(ly_a, ly_b)(idx) == ly_a(ly_b(idx))
+    //   - layout maps coord (or idx) to offset
+    //   - compose ly_a with ly_b requires ly_a's max input idx cover ly_b's max output offset
+    //   - not any two layouts can be composed, because the result mapping may not be able to be
+    //     represented with shape + stride
     using namespace cute;
     auto ly_a = make_layout(make_shape(Int<20>{}, _2{}), make_stride(_16{}, _4{}));
     auto ly_b = make_layout(make_shape(     _4{}, _5{}), make_stride( _1{}, _4{}));
-    p(composition(ly_a, ly_b)); // (_4,_5):(_16,_64)
+    auto ly_ab = composition(ly_a, ly_b);
+    p(ly_ab);           // (_4,_5):(_16,_64)
+    p(ly_ab(5));        // 80
+    p(ly_a(ly_b(5)));   // 80
+
+    auto a = make_layout(Shape<_4,_3>{}, Stride<_3,_1>{});
+    auto b = make_layout(Shape<_24>{});
+    p(composition(a, b));
 
     // layout products: reproduce one layout over another
     Layout tile            = Layout<Shape <_2,_2>,
                                     Stride<_1,_2>>{};
     Layout matrix_of_tiles = Layout<Shape <_3,_4>,
                                     Stride<_4,_1>>{};
-    
+
     p(tile);                                    // (_2,_2):(_1,_2)
     p(matrix_of_tiles);                         // (_3,_4):(_4,_1)
     p(logical_product(tile, matrix_of_tiles));  // ((_2,_2),(_3,_4)):((_1,_2),(_16,_4))
@@ -100,6 +124,25 @@ void test_layout_opeartion() {
     p(logical_divide(full_layout, tile_shape));     // ((_4),_4):((_3),_12)
     p(zipped_divide(full_layout, tile_shape));
     // p(tiled_divide(full_layout, tile_shape));
+}
+
+void test_swizzle() {
+    using namespace cute;
+    auto a = Layout<Shape<_8,_8>, Stride<_8,_1>>{};
+    cute::print_layout(a);
+    cute::print_layout(composition(Swizzle<0,0,0>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{})); // identity
+    cute::print_layout(composition(Swizzle<0,0,7>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{})); // identity
+    cute::print_layout(composition(Swizzle<0,1,0>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{})); // identity
+    cute::print_layout(composition(Swizzle<0,7,0>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{})); // identity
+    cute::print_layout(composition(Swizzle<1,0,1>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{}));
+    cute::print_layout(composition(Swizzle<1,0,2>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{}));
+    cute::print_layout(composition(Swizzle<1,0,3>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{}));
+    cute::print_layout(composition(Swizzle<1,1,1>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{}));
+    cute::print_layout(composition(Swizzle<1,2,1>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{}));
+    cute::print_layout(composition(Swizzle<2,0,3>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{}));
+    cute::print_layout(composition(Swizzle<2,0,-3>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{}));
+    cute::print_layout(composition(Swizzle<2,1,-3>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{}));
+    cute::print_layout(composition(Swizzle<3,3,3>{}, Layout<Shape<_8,_8>, Stride<_8,_1>>{}));
 }
 
 void __global__ test_debug_kernel() {
@@ -181,12 +224,16 @@ void __global__ test_tensor_kernel(void* ptr) {
         cute::Tensor gmem_8dx16s = make_tensor(gmem_ptr, cute::make_shape (      8    , cute::_16{}),
                                                          cute::make_stride(cute::_16{}, cute::_1{}));
         cute::Tensor gmem_16s = gmem_8dx16s(1, cute::_); // slice
-        cute::print(gmem_16s);       // (_16):(_1)
+        cute::print(gmem_16s);      // (_16):(_1)
         cute::print("\n");
 
-        // make_fragment_like (static src layouts only)
-        cute::Tensor rmem_16 = cute::make_fragment_like(gmem_16s);
-        cute::print(rmem_16);        // (_16):(_1)
+        // make_fragment_like (static src layouts only), inherit layout and dtype
+        cute::Tensor rmem_16s = cute::make_fragment_like(gmem_16s);
+        cute::print(rmem_16s);      // (_16):(_1)
+        cute::print("\n");
+        // if we only want reuse layout but not dtype, use make_tensor:
+        cute::Tensor rmem_16h = cute::make_tensor<cutlass::half_t>(make_layout_like(gmem_16s.layout()));
+        cute::print(rmem_16h);      // (_16):(_1)
         cute::print("\n");
     }
 
@@ -254,6 +301,46 @@ void test_algorithm() {
     // 6. clear
 }
 
+void __global__ test_mma_atom_kernel() {
+    // template <class MMA_Atom,
+    //         class AtomLayoutMNK   = Layout<Shape<_1,_1,_1>>,
+    //         class ValLayoutMNK    = Layout<Shape<_1,_1,_1>>,
+    //         class PermutationsMNK = Tile<Underscore,Underscore,Underscore>>
+    // struct TiledMMA : MMA_Atom;
+
+    // Here, the AtomLayoutMNK is the "thread" tiling of the atom -- how many replicates of this MMA atom do you want to tile across the logical MNK modes by distinct threads.
+    // The ValLayoutMNK similarly specific the tiling across replicate values instead -- how many atoms is each thread going to issue as a part of this tiled MMA.
+
+
+    using namespace cute;
+
+    constexpr int kNWarps = 2;
+    using MMA_Atom_Arch = MMA_Atom<SM80_16x8x16_S32S8S8S32_TN>;
+    using TiledMma = TiledMMA<
+        MMA_Atom_Arch,                      // MMA_atom:                                    16x8x16
+        Layout<Shape<Int<kNWarps>,_1,_1>>,  // MMA_atom * AtomLayoutMNK:                    
+        Layout<Shape<_1,_2,_2>>>;           // MMA_atom * AtomLayoutMNK * ValLayoutMNK:     
+
+    // dummy smem tensor
+    __shared__ int8_t smem_buf[128*32];
+    using BLK_M = _32;
+    using BLK_N = _16;
+    using BLK_K = _32;
+
+    Tensor sA = make_tensor(make_smem_ptr(smem_buf), Layout<Shape<BLK_M, BLK_K>>{}); // (BLK_M, BLK_K)
+    Tensor sB = make_tensor(make_smem_ptr(smem_buf), Layout<Shape<BLK_N, BLK_K>>{}); // (BLK_N, BLK_K)
+    pp(sA.layout());
+    pp(sB.layout());
+
+    const int thread_idx = 0;
+    TiledMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
+    Tensor tCrA = thr_mma.partition_fragment_A(sA);                     // (MMA, N_MMA_M, N_MMA_K)
+    Tensor tCrB = thr_mma.partition_fragment_B(sB);                     // (MMA, N_MMA_N, N_MMA_K)
+    pp(tCrA.layout());
+    pp(tCrB.layout());
+}
+
 
 void test_mma_atom() {
     // MMAs are architecture-specific. Different generations of GPU architectures introduce different sets of 
@@ -270,7 +357,9 @@ void test_mma_atom() {
     // - a single warp (Ampere); and
     // - a warpgroup (Hopper).
 
-    
+    // example:
+    test_mma_atom_kernel<<<1, 32>>>();
+    cudaDeviceSynchronize();
 }
 
 template<class Mshape, class NShape, class KShape,
@@ -308,7 +397,7 @@ gemm_kernel(const Mshape M, const NShape N, const KShape K,
 
     // alloc shared memory buffers
     __shared__ TA smemA_ptr[decltype(cute::cosize(sA))::value]; // BLK_M * BLK_K
-    __shared__ TC smemB_ptr[decltype(cute::cosize(sB))::value]; // BLK_N * BLK_K
+    __shared__ TB smemB_ptr[decltype(cute::cosize(sB))::value]; // BLK_N * BLK_K
 
     auto smemA = cute::make_tensor(cute::make_smem_ptr(smemA_ptr), sA);
     auto smemB = cute::make_tensor(cute::make_smem_ptr(smemB_ptr), sB);
@@ -541,6 +630,316 @@ void test_gemm_kernel() {
     cudaFree(d_c);
 }
 
+template<typename TileShape, class TA, class TB, class TC,
+        class TiledMma,
+        class GmemTiledCopyA, class SmemLayoutAtomA, class SmemCopyAtomA,
+        class GmemTiledCopyB, class SmemLayoutAtomB, class SmemCopyAtomB>
+__global__ void gemm_kernel_with_atom(int M, int N, int K,
+            const TA* __restrict__ A, const TB* __restrict__ B, TC* __restrict__ C) {
+    using namespace cute;
+
+    pp(TileShape{});        // (_128,_128,_64)
+    pp(SmemLayoutAtomA{});  // S<2,4,3> o _0 o (_16,_64):(_64,_1)
+    pp(SmemLayoutAtomB{});  // S<2,4,3> o _0 o (_16,_64):(_64,_1)
+
+    // =====================
+    // multi stage example
+    // using DispatchPolicy = cutlass::gemm::MainloopSm80CpAsync<3>;
+    // using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtomA{},
+    //                                            make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}),
+    //                                            Int<DispatchPolicy::Stages>{})));
+    // pp(SmemLayoutA{});  // S<2,4,3> o _0 o (_128,_64,_3):(_64,_1,_8192)
+
+    using SmemLayoutA = decltype(tile_to_shape(
+        SmemLayoutAtomA{},
+        make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}))));
+    using SmemLayoutB = decltype(tile_to_shape(
+        SmemLayoutAtomB{},
+        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}))));
+
+    pp(SmemLayoutA{});  // S<2,4,3> o _0 o (_128,_64):(_64,_1) : (BLK_M, BLK_K)
+    pp(SmemLayoutB{});  // S<2,4,3> o _0 o (_128,_64):(_64,_1) : (BLK_N, BLK_K)
+
+    static_assert(rank(SmemLayoutA{}) == 2);
+    static_assert(rank(SmemLayoutB{}) == 2);
+
+    // alloc shared memory buffers
+    __shared__ TA smemA_ptr[decltype(cute::cosize(SmemLayoutA{}))::value]; // BLK_M * BLK_K
+    __shared__ TB smemB_ptr[decltype(cute::cosize(SmemLayoutB{}))::value]; // BLK_N * BLK_K
+
+    Tensor sA = make_tensor(make_smem_ptr(smemA_ptr), SmemLayoutA{});
+    Tensor sB = make_tensor(make_smem_ptr(smemB_ptr), SmemLayoutB{});
+    pp(sA.layout());    // S<2,4,3> o _0 o (_128,_64):(_64,_1) : (BLK_M, BLK_K)
+    pp(sB.layout());    // S<2,4,3> o _0 o (_128,_64):(_64,_1) : (BLK_N, BLK_K)
+
+    // Represent the full tensors
+    auto gmemA = cute::make_tensor(cute::make_gmem_ptr(A), cute::make_layout(cute::make_shape(M, K), cute::GenRowMajor{}));
+    auto gmemB = cute::make_tensor(cute::make_gmem_ptr(B), cute::make_layout(cute::make_shape(N, K), cute::GenRowMajor{}));
+    auto gmemC = cute::make_tensor(cute::make_gmem_ptr(C), cute::make_layout(cute::make_shape(M, N), cute::GenRowMajor{}));
+
+    pp(gmemA.layout()); // (1024,1024):(1024,_1)
+    pp(gmemB.layout()); // (1024,1024):(1024,_1)
+    pp(gmemC.layout()); // (1024,1024):(1024,_1)
+
+    // Get the corresponding tiles for this thread block
+    // (M, K) => (BLK_M, BLK_K, ceil_div(K, BLK_K))
+    cute::Tensor gA = cute::local_tile(gmemA, sA.layout().shape(), cute::make_coord(blockIdx.x, cute::_));
+
+    // (N, K) => (BLK_N, BLK_K, ceil_div(K, BLK_K))
+    cute::Tensor gB = cute::local_tile(gmemB, sB.layout().shape(), cute::make_coord(blockIdx.y, cute::_));
+
+    // (M, N) => (BLK_M, BLK_N)
+    cute::Tensor gC = cute::local_tile(gmemC, 
+                                       cute::make_shape(cute::size<0>(sA), cute::size<0>(sB)),
+                                       cute::make_coord(blockIdx.x, blockIdx.y));
+
+    pp(gA.layout());    // (_128,_64,16):(1024,_1,_64)
+    pp(gB.layout());    // (_128,_64,16):(1024,_1,_64)
+    pp(gC.layout());    // (_128,_128):(1024,_1)
+
+
+    // threading binding for gmem=>smem copy using GmemTiledCopyA/B
+    const int thread_idx = threadIdx.x;
+    GmemTiledCopyA gmem_tiled_copy_a;
+    GmemTiledCopyB gmem_tiled_copy_b;
+    auto copy_a_thr = gmem_tiled_copy_a.get_slice(thread_idx);
+    auto copy_b_thr = gmem_tiled_copy_b.get_slice(thread_idx);
+
+    Tensor tAgA = copy_a_thr.partition_S(gA);
+    Tensor tAsA = copy_a_thr.partition_D(sA);
+    Tensor tBgB = copy_b_thr.partition_S(gB);
+    Tensor tBsB = copy_b_thr.partition_D(sB);
+    pp(tAsA.layout());  // ((_16,_1),_4,_1):((_1,_0),_2048,_0)         : (ACPY, ACPY_M, ACPY_K)
+    pp(tBsB.layout());  // ((_16,_1),_4,_1):((_1,_0),_2048,_0)         : (BCPY, BCPY_N, BCPY_K)
+    pp(tAgA.layout());  // ((_16,_1),_4,_1,16):((_1,_0),32768,_0,_64)  : (ACPY, ACPY_M, ACPY_K, k_loop)
+    pp(tBgB.layout());  // ((_16,_1),_4,_1,16):((_1,_0),32768,_0,_64)  : (BCPY, BCPY_N, BCPY_K, k_loop)
+
+    // 
+    // MMA compute
+    // 
+    TiledMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
+    // allocate regA and regB for each thread
+    Tensor tCrA  = thr_mma.partition_fragment_A(sA);
+    Tensor tCrB  = thr_mma.partition_fragment_B(sB);
+    pp(tCrA.layout());  // ((_4,_2,_2),_4,_2):((_1,_4,_8),_16,_64)  : (MMA_elem_per_thr, BLK_M/WP_M/MMA_M, BLK_K/WP_K/MMA_K)
+    pp(tCrB.layout());  // ((_4,_2),_8,_2):((_1,_4),_8,_64)         : (MMA_elem_per_thr, BLK_N/WP_N/MMA_N, BLK_K/WP_K/MMA_K)
+
+    // thread binding for gC
+    Tensor tCgC = thr_mma.partition_C(gC);
+    // allocate regC for each thread
+    Tensor tCrC = thr_mma.partition_fragment_C(gC);
+    pp(tCgC.layout());  // ((_2,_2),_4,_8):((_1,8192),32768,_16)
+    pp(tCrC.layout());  // ((_2,_2),_4,_8):((_1,_2),_4,_16)
+    cute::clear(tCrC);
+
+    // threading binding for smem
+    auto smem_tiled_copy_a = cute::make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
+    auto thr_copy_A        = smem_tiled_copy_a.get_thread_slice(thread_idx);
+    Tensor tCsA            = thr_copy_A.partition_S(sA);
+    Tensor tCrA_copy_view  = thr_copy_A.retile_D(tCrA);  // tCrA and tCrA_copy_view share same storage, 
+                                                         // tCrA_copy_view is used for efficient smem=>rmem copy
+    CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));
+    pp(tCsA.layout());              // ((_16,_1),_4,_2):((_1,_0),_2048,32)  : (MMA_elem_per_thr, BLK_M/WP_M/MMA_M, BLK_K/WP_K/MMA_K)
+    pp(tCrA_copy_view.layout());    // ((_16,_1),_4,_2):((_1,_0),_16,_64)   : (MMA_elem_per_thr, BLK_M/WP_M/MMA_M, BLK_K/WP_K/MMA_K)
+    // tCrA and tCrA_copy_view share same storage
+    // pp(tCrA(0));            // 0
+    // pp(tCrA_copy_view(0));  // 0
+    // tCrA(0) = 123;
+    // pp(tCrA_copy_view(0));  // 123
+
+    auto smem_tiled_copy_b = cute::make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
+    auto thr_copy_B        = smem_tiled_copy_b.get_thread_slice(thread_idx);
+    Tensor tCsB            = thr_copy_B.partition_S(sB);
+    Tensor tCrB_copy_view  = thr_copy_B.retile_D(tCrB);  // tCrB and tCrB_copy_view share same storage
+                                                         // tCrB_copy_view is used for efficient smem=>rmem copy
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));
+    pp(tCsB.layout());              // ((_16,_1),_4,_2):((_1,_0),_2048,32)  : (MMA_elem_per_thr, BLK_N/WP_N/MMA_N, BLK_K/WP_K/MMA_K)
+    pp(tCrB_copy_view.layout());    // ((_16,_1),_4,_2):((_1,_0),_16,_64)   : (MMA_elem_per_thr, BLK_N/WP_N/MMA_N, BLK_K/WP_K/MMA_K)
+
+    // 
+    // GEMM main loop (outer k)
+    // 
+    auto k_loop = size<3>(tAgA); // ceil_div(K, BLK_K)
+    for (int k=0; k<k_loop; ++k) {
+        // copy gmem => smem (use LDGSTS(cp.async))
+        copy(gmem_tiled_copy_a, tAgA(_,_,_,k), tAsA);
+        cute::cp_async_fence();     // cp.async.commit_group
+        copy(gmem_tiled_copy_b, tBgB(_,_,_,k), tBsB);
+        cute::cp_async_fence();     // cp.async.commit_group
+        cute::cp_async_wait<0>();   // cp.async_wait_group 0
+        __syncthreads();
+
+        // copy smem => rmem (use LDSM)
+        copy(smem_tiled_copy_a, tCsA, tCrA_copy_view);
+        copy(smem_tiled_copy_b, tCsB, tCrB_copy_view);
+
+        __syncthreads();
+
+        // tensor core mma
+        cute::gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
+
+        // or use explicit GEMM inner loop (inner k)
+        // auto k_inner_loop = size<2>(tCrA);  // BLK_K/WP_K/MMA_K
+        // for (int inn_k=0; inn_k<k_inner_loop; ++inn_k) {
+        //     // tensor core mma
+        //     cute::gemm(tiled_mma, tCrC, tCrA(_,_,inn_k), tCrB(_,_,inn_k), tCrC);
+        // }
+    }
+
+    // copy rmem=>gmem
+    copy(tCrC, tCgC);
+}
+
+template<typename TA, typename TB, typename TC>
+void gemm_with_atom(TA* a_ptr, TB* b_ptr, TC* c_ptr, const int M, const int N, const int K) {
+    using namespace cute;
+    // device tensor layout
+    // - A: MxK (K-major)
+    // - B: NxK (K-major)
+    // - C: M*N (N-major)
+
+    // Define block sizes (static)
+    using bM = cute::_128;
+    using bN = cute::_128;
+    using bK = cute::_64;
+
+    using TileShape = Shape<bM, bN, bK>;
+    static constexpr int ThreadCount = 128;
+
+    using TiledMma = TiledMMA<
+        MMA_Atom<SM80_16x8x32_S32S8S8S32_TN>,
+        Layout<Shape<_2,_2,_1>>,   // 2x2x1 thread group (equals to #warp)
+        Layout<Shape<_1,_2,_1>>>;  // 1x2x1 value group for 16x16x32 and LDSM (seems equals to 16x16x256bit?)
+
+    // ===== for A (M,K)  K-major =====
+    using SmemLayoutAtomA = decltype(
+        composition(
+        Swizzle<2,4,3>{},
+        Layout<Shape <_16,_64>,
+               Stride<_64, _1>>{}));
+
+    static_assert(rank(SmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
+    static_assert((size<0>(TileShape{}) % size<0>(SmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
+    static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
+
+    static constexpr int kAlignmentA = 16;
+    // for gmemA=>smemA
+    using GmemTiledCopyA = decltype(
+        make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, int8_t>{},
+                        Layout<Shape<_32,_4>, Stride<_4,_1>>{},     // thread layout, s.t. BLK_K % kAlignmentA * THR_K == 0
+                        Layout<Shape<_1, Int<kAlignmentA>>>{}));    // value layout, s.t. kAlignmentA = sizeof(uint128_t) / sizeof(int8_t)
+
+    // LDS.32- or LDSM-based copy atom
+    // using SmemCopyAtomA = Copy_Atom<DefaultCopy, uint8_t>;
+    // for smemA=>rmemA
+    using SmemCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, uint8_t>;   // LDSM works
+
+    // ===== for B (N,K)  K-major =====
+    using SmemLayoutAtomB = decltype(
+    composition(
+        Swizzle<2,4,3>{},
+        Layout<Shape <_16,_64>,
+                Stride<_64, _1>>{}));
+
+    static_assert(rank(SmemLayoutAtomB{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
+    static_assert((size<1>(TileShape{}) % size<0>(SmemLayoutAtomB{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
+    static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomB{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
+
+    static constexpr int kAlignmentB = 16;
+    using GmemTiledCopyB = decltype(
+    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, int8_t>{},
+                    Layout<Shape<_32,_4>, Stride< _4,_1>>{},    // thread layout, s.t. BLK_K % kAlignmentB * THR_K == 0
+                    Layout<Shape<_1,Int<kAlignmentB>>>{}));     // value layout, s.t. kAlignmentB = sizeof(uint128_t) / sizeof(int8_t)
+
+    // LDS.32- or LDSM-based copy atom
+    // using SmemCopyAtomB = Copy_Atom<DefaultCopy, uint32_t>;
+    using SmemCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, uint8_t>;  // LDSM works
+
+    dim3 dimGrid(cute::ceil_div(M, bM{}), cute::ceil_div(N, bN{}));
+    dim3 dimBlock(ThreadCount);
+
+    cudaStream_t stream = 0;
+    gemm_kernel_with_atom<
+        TileShape, TA, TB, TC,
+        TiledMma,
+        GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA,
+        GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB
+    ><<<dimGrid, dimBlock, 0, stream>>>(
+        M, N, K,
+        a_ptr, b_ptr, c_ptr
+    );
+}
+
+void test_gemm_with_atom_kernel() {
+    constexpr int M = 1024;
+    constexpr int N = 1024;
+    constexpr int K = 1024;
+
+    using TA = int8_t;
+    using TB = int8_t;
+    using TC = int32_t;
+
+    size_t size_a = M * K * sizeof(TA);
+    size_t size_b = K * N * sizeof(TB);
+    size_t size_c = M * N * sizeof(TC);
+
+    TA* h_a = (TA*) malloc(size_a);
+    TB* h_b = (TB*) malloc(size_b);
+    TC* h_c = (TC*) malloc(size_c);
+    TC* h_c_ref = (TC*) malloc(size_c);
+
+    TA* d_a;
+    TB* d_b;
+    TC* d_c;
+    cudaMalloc(&d_a, size_a);
+    cudaMalloc(&d_b, size_b);
+    cudaMalloc(&d_c, size_c);
+
+    srand(time(0));
+    for (int i=0; i<M*K; ++i) {
+        h_a[i] = (TA)(rand() / 256 - 128);
+    }
+    for (int i=0; i<K*N; ++i) {
+        h_b[i] = (TB)(rand() / 256 - 128);
+    }
+    for (int i=0; i<M*N; ++i) {
+        h_c[i] = (TC)(0);
+    }
+    cudaMemcpy(d_a, h_a, size_a, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, h_b, size_b, cudaMemcpyHostToDevice);
+    gemm_with_atom(d_a, d_b, d_c, M, N, K);
+    cudaMemcpy(h_c, d_c, size_c, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    CUTE_CHECK_LAST();
+
+    // check error
+    // for (int im=0; im<M; ++im) {
+    //     for (int in=0; in<N; ++in) {
+    //         TC acc = (TC)0.0;
+    //         for (int ik=0; ik<K; ++ik) {
+    //             acc += h_a[im * K + ik] * h_b[in * K + ik];
+    //         }
+    //         double rel_err = cute::abs((double)h_c[im * N + in] - (double)acc) / (double)acc;
+    //         if ((im * N + in) % (M * N / 10) == 0) {
+    //             printf("gt=%d, out=%d, at (%d,%d)\n", acc, h_c[im * N + in], im, in);
+    //         }
+    //         if (rel_err > 0.01) {
+    //             printf("error occured: with gt=%d, out=%d, at (%d,%d)\n", acc, h_c[im * N + in], im, in);
+    //             exit(1);
+    //         }
+    //     }
+    // }
+
+    free(h_a);
+    free(h_b);
+    free(h_c);
+    free(h_c_ref);
+    cudaFree(d_a);
+    cudaFree(d_b);
+    cudaFree(d_c);
+}
+
 template<class BlockLayout, class ThreadLayout>
 __global__ void __launch_bounds__(decltype(cute::size(ThreadLayout{}))::value)
 predication_kernel(const BlockLayout sA, const ThreadLayout tA) {
@@ -605,10 +1004,12 @@ int main() {
     test_int_tuple();
     test_layout();
     test_layout_opeartion();
+    test_swizzle();
     test_debug();
     test_tensor();
     test_algorithm();
     test_mma_atom();
     test_gemm_kernel();
+    test_gemm_with_atom_kernel();
     test_predication();
 }
